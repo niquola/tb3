@@ -23,6 +23,18 @@ console.log(`Bot: @${botUsername}`);
 await Bun.$`mkdir -p ${process.cwd()}/threads`;
 await Bun.$`mkdir -p ${process.cwd()}/files`;
 
+// Register bot commands
+await api("setMyCommands", {
+  commands: [
+    { command: "claude", description: "Start Claude agent: /claude <path>" },
+    { command: "codex", description: "Start Codex agent: /codex <path>" },
+    { command: "mode", description: "Set agent mode (default/plan/acceptEdits/bypassPermissions)" },
+    { command: "model", description: "Set model (default/sonnet/haiku)" },
+    { command: "clear", description: "Kill current agent session" },
+    { command: "cancel", description: "Cancel running prompt" },
+  ],
+});
+
 // Health HTTP server
 const port = parseInt(process.env.HTTP_PORT || "3034");
 Bun.serve({

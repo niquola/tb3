@@ -5,6 +5,12 @@ export type AgentType = "claude" | "codex";
 
 export type CallbacksRef = { current: SessionCallbacks };
 
+export type SessionInfo = {
+  modes?: { availableModes: Array<{ id: string; name: string; description?: string }>; currentModeId: string };
+  models?: { availableModels?: Array<{ id: string; name: string }>; currentModelId?: string };
+  configOptions?: Array<any>;
+};
+
 export type AgentHandle = {
   connection: ClientSideConnection;
   process: ChildProcess;
@@ -12,6 +18,7 @@ export type AgentHandle = {
   agentType: AgentType;
   cwd: string;
   callbacksRef: CallbacksRef;
+  sessionInfo: SessionInfo;
 };
 
 export type ToolCallInfo = {

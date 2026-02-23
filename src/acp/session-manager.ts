@@ -88,6 +88,28 @@ async function spawnAndRestore(
     active: true,
   });
 
+  // Apply saved mode/model preferences
+  const savedMode = db.getModePref(chatId, threadId);
+  const savedModel = db.getModelPref(chatId, threadId);
+  if (savedMode && savedMode !== "default") {
+    try {
+      await handle.connection.setSessionMode({ sessionId: handle.sessionId, modeId: savedMode });
+      if (handle.sessionInfo.modes) handle.sessionInfo.modes.currentModeId = savedMode;
+      console.log(`[session] ${key} restored mode: ${savedMode}`);
+    } catch (err) {
+      console.error(`[session] ${key} failed to restore mode ${savedMode}:`, err);
+    }
+  }
+  if (savedModel && savedModel !== "default") {
+    try {
+      await handle.connection.unstable_setSessionModel({ sessionId: handle.sessionId, modelId: savedModel });
+      if (handle.sessionInfo.models) handle.sessionInfo.models.currentModelId = savedModel;
+      console.log(`[session] ${key} restored model: ${savedModel}`);
+    } catch (err) {
+      console.error(`[session] ${key} failed to restore model ${savedModel}:`, err);
+    }
+  }
+
   setupExitHandler(handle, chatId, threadId);
   return handle;
 }
@@ -207,4 +229,63 @@ export function killAgent(chatId: number, threadId: number): boolean {
 
 export function getActiveAgentCount(): number {
   return liveAgents.size;
+}
+
+// --- Session info / mode / model ---
+
+export function getSessionInfo(chatId: number, threadId: number): import("./types").SessionInfo | null {
+  const key = threadKey(chatId, threadId);
+  const handle = liveAgents.get(key);
+  if (!handle || handle.process.killed) return null;
+  return handle.sessionInfo;
+}
+
+export async function setMode(chatId: number, threadId: number, modeId: string): Promise<boolean> {
+  const key = threadKey(chatId, threadId);
+  const handle = liveAgents.get(key);
+  if (!handle || handle.process.killed) return false;
+
+  await handle.connection.setSessionMode({
+    sessionId: handle.sessionId,
+    modeId,
+  });
+  if (handle.sessionInfo.modes) {
+    handle.sessionInfo.modes.currentModeId = modeId;
+  }
+  // Persist
+  await db.setModePref(chatId, threadId, modeId);
+  console.log(`[session] ${key} mode -> ${modeId}`);
+  return true;
+}
+
+export async function setModel(chatId: number, threadId: number, modelId: string): Promise<boolean> {
+  const key = threadKey(chatId, threadId);
+  const handle = liveAgents.get(key);
+  if (!handle || handle.process.killed) return false;
+
+  await handle.connection.unstable_setSessionModel({
+    sessionId: handle.sessionId,
+    modelId,
+  });
+  if (handle.sessionInfo.models) {
+    handle.sessionInfo.models.currentModelId = modelId;
+  }
+  // Persist
+  await db.setModelPref(chatId, threadId, modelId);
+  console.log(`[session] ${key} model -> ${modelId}`);
+  return true;
+}
+
+export async function setConfigOption(chatId: number, threadId: number, configId: string, value: string): Promise<boolean> {
+  const key = threadKey(chatId, threadId);
+  const handle = liveAgents.get(key);
+  if (!handle || handle.process.killed) return false;
+
+  await handle.connection.setSessionConfigOption({
+    sessionId: handle.sessionId,
+    configId,
+    value,
+  });
+  console.log(`[session] ${key} config ${configId} -> ${value}`);
+  return true;
 }

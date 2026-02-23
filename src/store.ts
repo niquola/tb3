@@ -9,6 +9,8 @@ export type ThreadState = {
   name: string;
   session_id?: string;
   active?: boolean;
+  mode?: string;
+  model?: string;
 };
 
 type State = {
@@ -81,6 +83,30 @@ export async function setWorkdir(chatId: number, threadId: number, workdir: stri
     state.threads[k].workdir = workdir;
     await save();
   }
+}
+
+export async function setModePref(chatId: number, threadId: number, mode: string): Promise<void> {
+  const k = key(chatId, threadId);
+  if (state.threads[k]) {
+    state.threads[k].mode = mode;
+    await save();
+  }
+}
+
+export async function setModelPref(chatId: number, threadId: number, model: string): Promise<void> {
+  const k = key(chatId, threadId);
+  if (state.threads[k]) {
+    state.threads[k].model = model;
+    await save();
+  }
+}
+
+export function getModePref(chatId: number, threadId: number): string | undefined {
+  return state.threads[key(chatId, threadId)]?.mode;
+}
+
+export function getModelPref(chatId: number, threadId: number): string | undefined {
+  return state.threads[key(chatId, threadId)]?.model;
 }
 
 export function findThreadByWorkdir(workdir: string): ThreadConfig | null {

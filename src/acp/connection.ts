@@ -16,9 +16,11 @@ function cleanEnv(): Record<string, string> {
   return env;
 }
 
+const BIN_DIR = `${process.cwd()}/node_modules/.bin`;
+
 const AGENT_COMMANDS: Record<AgentType, { command: string; args: string[] }> = {
   claude: {
-    command: "claude-agent-acp",
+    command: `${BIN_DIR}/claude-agent-acp`,
     args: [],
   },
   codex: {
@@ -76,7 +78,15 @@ export async function spawnAgent(
     mcpServers: [],
   });
 
-  console.log(`[acp] session created: ${session.sessionId}`);
+  const sessionInfo = {
+    modes: (session as any).modes,
+    models: (session as any).models,
+    configOptions: (session as any).configOptions,
+  };
+
+  console.log(`[acp] session created: ${session.sessionId}`,
+    sessionInfo.modes ? `modes: ${sessionInfo.modes.availableModes?.map((m: any) => m.id).join(",")}` : "",
+    sessionInfo.models ? `models: ${JSON.stringify(sessionInfo.models)}` : "");
 
   return {
     connection,
@@ -85,6 +95,7 @@ export async function spawnAgent(
     agentType,
     cwd,
     callbacksRef: { current: null as any },
+    sessionInfo,
   };
 }
 
@@ -134,16 +145,18 @@ export async function loadExistingSession(
   // Try loadSession first, then resumeSession, then newSession
   let sessionId: string;
 
+  let sessionInfo: any = {};
+
   try {
     console.log(`[acp] trying loadSession: ${savedSessionId}`);
-    await connection.loadSession({
+    const loadRes = await connection.loadSession({
       sessionId: savedSessionId,
       cwd,
       mcpServers: [],
     });
-    // loadSession response doesn't include sessionId — use the one we passed in
     sessionId = savedSessionId;
-    console.log(`[acp] loadSession succeeded: ${sessionId}`);
+    sessionInfo = { modes: (loadRes as any).modes, models: (loadRes as any).models, configOptions: (loadRes as any).configOptions };
+    console.log(`[acp] loadSession succeeded: ${sessionId}`, JSON.stringify(sessionInfo));
   } catch (loadErr) {
     console.log(`[acp] loadSession failed, trying resumeSession:`, loadErr);
     try {
@@ -161,6 +174,7 @@ export async function loadExistingSession(
         mcpServers: [],
       });
       sessionId = newSess.sessionId;
+      sessionInfo = { modes: (newSess as any).modes, models: (newSess as any).models, configOptions: (newSess as any).configOptions };
       console.log(`[acp] new session created: ${sessionId}`);
     }
   }
@@ -172,5 +186,6 @@ export async function loadExistingSession(
     agentType,
     cwd,
     callbacksRef: { current: null as any },
+    sessionInfo,
   };
 }

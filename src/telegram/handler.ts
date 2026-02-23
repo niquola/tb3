@@ -103,7 +103,7 @@ class ToolCallTracker {
         : (info.rawInput as any).command || (info.rawInput as any).cmd || "";
       if (cmd) {
         const short = cmd.length > 200 ? cmd.slice(0, 200) + "..." : cmd;
-        return `${icon} ${info.title}\n\`\`\`\n${short}\n\`\`\``;
+        return `${icon} ${info.title}\n\`\`\`bash\n${short}\n\`\`\``;
       }
     }
 
@@ -243,6 +243,45 @@ async function requestPermissionViaTelegram(
 
 function handleCallbackQuery(query: any): void {
   const data = query.data as string;
+  const chatId = query.message?.chat?.id;
+  const threadId = query.message?.message_thread_id || 0;
+
+  // Mode selection: "m:modeId"
+  if (data.startsWith("m:") && chatId) {
+    const modeId = data.slice(2);
+    const config = db.getThreadConfig(chatId, threadId);
+    const label = config?.name || "";
+    // Answer immediately so Telegram stops showing loading spinner
+    api("answerCallbackQuery", { callback_query_id: query.id, text: `mode: ${modeId}` });
+    if (query.message) deleteMessage(chatId, query.message.message_id);
+    sessions.setMode(chatId, threadId, modeId)
+      .then(() => {
+        sendTelegramMessage(chatId, `[${label}] mode: ${modeId}`, { format: false, message_thread_id: threadId || undefined });
+      })
+      .catch((err) => {
+        sendTelegramMessage(chatId, `Failed to set mode: ${err}`, { format: false, message_thread_id: threadId || undefined });
+      });
+    return;
+  }
+
+  // Direct model selection: "md:modelId"
+  if (data.startsWith("md:") && chatId) {
+    const modelId = data.slice(3);
+    const config = db.getThreadConfig(chatId, threadId);
+    const label = config?.name || "";
+    // Answer immediately so Telegram stops showing loading spinner
+    api("answerCallbackQuery", { callback_query_id: query.id, text: `model: ${modelId}` });
+    if (query.message) deleteMessage(chatId, query.message.message_id);
+    sessions.setModel(chatId, threadId, modelId)
+      .then(() => {
+        sendTelegramMessage(chatId, `[${label}] model: ${modelId}`, { format: false, message_thread_id: threadId || undefined });
+      })
+      .catch((err) => {
+        sendTelegramMessage(chatId, `Failed to set model: ${err}`, { format: false, message_thread_id: threadId || undefined });
+      });
+    return;
+  }
+
   if (!data.startsWith("p:")) return;
 
   const parts = data.split(":");
@@ -294,7 +333,9 @@ export async function handleUpdate(update: any): Promise<void> {
 
   const chatId = msg.chat.id;
   const threadId = msg.message_thread_id || 0;
-  const text = msg.text || msg.caption || "";
+  const rawText = msg.text || msg.caption || "";
+  // Strip @botname from commands (e.g. /mode@niquola_cbot -> /mode)
+  const text = rawText.replace(/^(\/\w+)@\w+/, "$1");
   const fromId = msg.from?.id;
   const fromName = msg.from?.first_name || msg.from?.username || "Unknown";
 
@@ -347,6 +388,74 @@ export async function handleUpdate(update: any): Promise<void> {
     return;
   }
 
+  // /mode [id] — show or set agent mode (plan, code, ask, etc.)
+  if (text === "/mode" || text.startsWith("/mode ")) {
+    const config = db.getThreadConfig(chatId, threadId);
+    const info = sessions.getSessionInfo(chatId, threadId);
+    console.log(`[/mode] chatId=${chatId} threadId=${threadId} config=${!!config} info=${!!info} modes=${!!info?.modes}`);
+    if (!info?.modes || !config) {
+      await sendTelegramMessage(chatId, "No active agent. Start with /claude first.", { format: false, message_thread_id: threadId || undefined });
+      return;
+    }
+    const label = config.name || config.workdir;
+    const arg = text.replace(/^\/mode\s*/, "").trim();
+    if (arg) {
+      try {
+        await sessions.setMode(chatId, threadId, arg);
+        await sendTelegramMessage(chatId, `[${label}] mode: ${arg}`, { format: false, message_thread_id: threadId || undefined });
+      } catch (err) {
+        await sendTelegramMessage(chatId, `Failed: ${err}`, { format: false, message_thread_id: threadId || undefined });
+      }
+    } else {
+      const modes = info.modes.availableModes || [];
+      const current = info.modes.currentModeId;
+      const keyboard = modes.map((m) => [{
+        text: `${m.id === current ? "● " : ""}${m.name || m.id}`,
+        callback_data: `m:${m.id}`,
+      }]);
+      await sendTelegramMessage(chatId, `[${label}] mode: ${current}`, {
+        format: false,
+        message_thread_id: threadId || undefined,
+        reply_markup: { inline_keyboard: keyboard },
+      });
+    }
+    return;
+  }
+
+  // /model [id] — show or set model
+  if (text === "/model" || text.startsWith("/model ")) {
+    const config = db.getThreadConfig(chatId, threadId);
+    const info = sessions.getSessionInfo(chatId, threadId);
+    console.log(`[/model] chatId=${chatId} threadId=${threadId} config=${!!config} info=${!!info} models=${!!info?.models}`);
+    if (!info?.models || !config) {
+      await sendTelegramMessage(chatId, "No active agent. Start with /claude first.", { format: false, message_thread_id: threadId || undefined });
+      return;
+    }
+    const label = config.name || config.workdir;
+    const arg = text.replace(/^\/model\s*/, "").trim();
+    if (arg) {
+      try {
+        await sessions.setModel(chatId, threadId, arg);
+        await sendTelegramMessage(chatId, `[${label}] model: ${arg}`, { format: false, message_thread_id: threadId || undefined });
+      } catch (err) {
+        await sendTelegramMessage(chatId, `Failed: ${err}`, { format: false, message_thread_id: threadId || undefined });
+      }
+    } else {
+      const models = info.models.availableModels || [];
+      const current = info.models.currentModelId;
+      const keyboard = models.map((m: any) => [{
+        text: `${(m.modelId || m.id) === current ? "● " : ""}${m.name || m.modelId || m.id}`,
+        callback_data: `md:${m.modelId || m.id}`,
+      }]);
+      await sendTelegramMessage(chatId, `[${label}] model: ${current || "default"}`, {
+        format: false,
+        message_thread_id: threadId || undefined,
+        reply_markup: { inline_keyboard: keyboard },
+      });
+    }
+    return;
+  }
+
   // /claude [path] — set workdir and start claude agent
   if (text.startsWith("/claude") || text.startsWith("/codex")) {
     const agentType = text.startsWith("/claude") ? "claude" : "codex";
@@ -355,7 +464,9 @@ export async function handleUpdate(update: any): Promise<void> {
     if (rawPath) {
       // Set new workdir
       let folderPath: string;
-      if (rawPath.startsWith("~/")) {
+      if (rawPath === "system") {
+        folderPath = process.cwd(); // project root
+      } else if (rawPath.startsWith("~/")) {
         folderPath = rawPath.replace("~", process.env.HOME || "~");
       } else if (rawPath.startsWith("/")) {
         folderPath = rawPath;
@@ -387,14 +498,14 @@ export async function handleUpdate(update: any): Promise<void> {
         name: `${agentType}:${rawPath}`,
       });
 
-      await sendTelegramMessage(chatId, `${agentType} ready\nworkdir: ${folderPath}`, { format: false });
+      await sendTelegramMessage(chatId, `${agentType} ready\nworkdir: ${folderPath}`, { format: false, message_thread_id: threadId || undefined });
     } else {
       // No path — show current config or usage
       const config = db.getThreadConfig(chatId, threadId);
       if (config) {
-        await sendTelegramMessage(chatId, `${config.agent_type} active\nworkdir: ${config.workdir}`, { format: false });
+        await sendTelegramMessage(chatId, `${config.agent_type} active\nworkdir: ${config.workdir}`, { format: false, message_thread_id: threadId || undefined });
       } else {
-        await sendTelegramMessage(chatId, `Usage: /claude <path>\nExamples:\n  /claude health\n  /claude ~/myrepo\n  /codex myproject`, { format: false });
+        await sendTelegramMessage(chatId, `Usage: /claude <path>\nExamples:\n  /claude health\n  /claude ~/myrepo\n  /codex myproject`, { format: false, message_thread_id: threadId || undefined });
       }
     }
     return;
@@ -405,7 +516,7 @@ export async function handleUpdate(update: any): Promise<void> {
   // --- Regular message → send to ACP agent ---
   const config = db.getThreadConfig(chatId, threadId);
   if (!config) {
-    await sendTelegramMessage(chatId, `No agent. Start with:\n  /claude health\n  /claude ~/myrepo`, { format: false });
+    await sendTelegramMessage(chatId, `No agent. Start with:\n  /claude health\n  /claude ~/myrepo`, { format: false, message_thread_id: threadId || undefined });
     return;
   }
 
@@ -449,6 +560,6 @@ export async function handleUpdate(update: any): Promise<void> {
     await accumulator.flush();
     await toolTracker.cleanup();
     console.error(`[agent] error:`, err);
-    await sendTelegramMessage(chatId, `Error: ${String(err)}`, { format: false });
+    await sendTelegramMessage(chatId, `Error: ${String(err)}`, { format: false, message_thread_id: threadId || undefined });
   }
 }
