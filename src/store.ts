@@ -175,6 +175,16 @@ export async function markSessionInactive(chatId: number, threadId: number): Pro
   }
 }
 
+// Clear session entirely (for fresh start)
+export async function clearSession(chatId: number, threadId: number): Promise<void> {
+  const k = key(chatId, threadId);
+  if (state.threads[k]) {
+    state.threads[k].active = false;
+    delete state.threads[k].session_id;
+    await save();
+  }
+}
+
 export function getActiveSessions(): AcpSession[] {
   const results: AcpSession[] = [];
   for (const [k, t] of Object.entries(state.threads)) {

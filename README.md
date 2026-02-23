@@ -24,15 +24,36 @@ HTTP_PORT=3034
 bun src/index.ts
 ```
 
+### launchd (macOS)
+
+Auto-start on login with auto-restart on crash:
+
+```bash
+# Start
+launchctl load ~/Library/LaunchAgents/com.niquola.tb3.plist
+
+# Stop
+launchctl unload ~/Library/LaunchAgents/com.niquola.tb3.plist
+
+# Restart
+launchctl stop com.niquola.tb3
+
+# Logs
+tail -f ~/tb3/logs/stdout.log
+tail -f ~/tb3/logs/stderr.log
+```
+
 ## Commands
 
 | Command | Description |
 |---------|-------------|
-| `/claude <path>` | Start Claude agent (e.g. `/claude health`, `/claude ~/myrepo`, `/claude system`) |
+| `/claude <path>` | Start Claude agent with fresh session |
+| `/claude --resume` | Resume a previously stopped session |
 | `/codex <path>` | Start Codex agent |
+| `/stop` | Stop agent (preserves session for resume) |
+| `/clear` | Clear session entirely (fresh start) |
 | `/mode` | Set agent mode (default, plan, acceptEdits, bypassPermissions) |
 | `/model` | Set model (Opus 4.6, Sonnet 4.6, Haiku 4.5) |
-| `/clear` | Kill current agent session |
 | `/cancel` | Cancel running prompt |
 
 ## API

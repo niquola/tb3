@@ -24,8 +24,8 @@ const AGENT_COMMANDS: Record<AgentType, { command: string; args: string[] }> = {
     args: [],
   },
   codex: {
-    command: "codex",
-    args: ["app-server", "--listen", "stdio://"],
+    command: `${BIN_DIR}/codex-acp`,
+    args: [],
   },
 };
 

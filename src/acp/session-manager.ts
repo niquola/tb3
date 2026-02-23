@@ -185,6 +185,39 @@ async function getOrCreateAgent(
   );
 }
 
+// Resume a stopped session — use saved session_id regardless of active flag
+export async function resumeAgent(
+  chatId: number,
+  threadId: number,
+  agentType: AgentType,
+  callbacks: SessionCallbacks,
+  cwdOverride?: string
+): Promise<{ resumed: boolean; sessionId: string }> {
+  const key = threadKey(chatId, threadId);
+
+  // Kill existing if any
+  const existing = liveAgents.get(key);
+  if (existing && !existing.process.killed) {
+    existing.process.kill();
+    liveAgents.delete(key);
+  }
+
+  const savedSession = await db.getAcpSession(chatId, threadId);
+  const threadConfig = await db.getThreadConfig(chatId, threadId);
+  const cwd = cwdOverride || threadConfig?.workdir || `${process.cwd()}/threads/default`;
+  const callbacksRef: CallbacksRef = { current: callbacks };
+
+  // Try to resume with saved session_id (even if inactive)
+  const handle = await spawnAndRestore(
+    chatId, threadId, agentType, cwd,
+    savedSession?.session_id || null,
+    callbacksRef
+  );
+
+  const resumed = savedSession?.session_id ? handle.sessionId === savedSession.session_id : false;
+  return { resumed, sessionId: handle.sessionId };
+}
+
 export async function sendPrompt(
   chatId: number,
   threadId: number,
@@ -216,7 +249,8 @@ export async function cancelPrompt(chatId: number, threadId: number): Promise<bo
   return true;
 }
 
-export function killAgent(chatId: number, threadId: number): boolean {
+// Stop agent — kill process but keep session_id for later resume
+export function stopAgent(chatId: number, threadId: number): boolean {
   const key = threadKey(chatId, threadId);
   const handle = liveAgents.get(key);
   if (!handle) return false;
@@ -227,8 +261,33 @@ export function killAgent(chatId: number, threadId: number): boolean {
   return true;
 }
 
+// Kill agent — kill process AND clear session_id (fresh start next time)
+export function killAgent(chatId: number, threadId: number): boolean {
+  const key = threadKey(chatId, threadId);
+  const handle = liveAgents.get(key);
+  if (!handle) return false;
+
+  handle.process.kill();
+  liveAgents.delete(key);
+  db.clearSession(chatId, threadId).catch(console.error);
+  return true;
+}
+
 export function getActiveAgentCount(): number {
   return liveAgents.size;
+}
+
+// Kill all live agent processes (for graceful shutdown)
+export function killAllAgents(): void {
+  for (const [key, handle] of liveAgents) {
+    try {
+      if (!handle.process.killed) {
+        handle.process.kill();
+        console.log(`[shutdown] killed agent ${key}`);
+      }
+    } catch {}
+  }
+  liveAgents.clear();
 }
 
 // --- Session info / mode / model ---

@@ -97,22 +97,45 @@ class ToolCallTracker {
     const icon = TOOL_ICONS[info.kind || "other"] || "🔧";
 
     // For execute/bash tools, show the command as a code block
-    if (info.kind === "execute" && info.rawInput) {
-      const cmd = typeof info.rawInput === "string"
-        ? info.rawInput
-        : (info.rawInput as any).command || (info.rawInput as any).cmd || "";
+    if (info.kind === "execute") {
+      const cmd = info.rawInput
+        ? (typeof info.rawInput === "string"
+            ? info.rawInput
+            : (info.rawInput as any).command || (info.rawInput as any).cmd || "")
+        : "";
+
       if (cmd) {
         const short = cmd.length > 200 ? cmd.slice(0, 200) + "..." : cmd;
-        return `${icon} ${info.title}\n\`\`\`bash\n${short}\n\`\`\``;
+        return `${icon}\n\`\`\`bash\n${short}\n\`\`\``;
       }
+
+      // Title IS the command (not generic "Terminal"/"Bash")
+      const title = info.title || "";
+      if (title && !["Terminal", "Bash", "Execute", "terminal", "bash"].includes(title)) {
+        const short = title.length > 200 ? title.slice(0, 200) + "..." : title;
+        return `${icon}\n\`\`\`bash\n${short}\n\`\`\``;
+      }
+
+      return `${icon} ${title || "Terminal"}`;
     }
 
     return `${icon} ${info.title}`;
   }
 
+  private isGenericTitle(title: string): boolean {
+    return ["Terminal", "Bash", "Execute", "terminal", "bash", "execute"].includes(title);
+  }
+
   async onToolCall(info: ToolCallInfo): Promise<void> {
     // Don't show messages for already-completed tools (from session replay)
     if (info.status === "completed") return;
+
+    // For generic titles like "Terminal" — don't show yet, wait for update with actual command
+    if (this.isGenericTitle(info.title)) {
+      // Just register the tool call ID so we can post when the command arrives
+      this.toolMessages.set(info.toolCallId, 0); // 0 = placeholder, no message sent yet
+      return;
+    }
 
     const text = this.formatToolText(info);
     const res = await sendTelegramMessage(this.chatId, text, {
@@ -125,20 +148,17 @@ class ToolCallTracker {
 
   async onUpdate(info: ToolCallInfo): Promise<void> {
     if (info.status === "completed") {
-      // Delete the in-progress message
       const msgId = this.toolMessages.get(info.toolCallId);
-      if (msgId) {
+      if (msgId && msgId > 0) {
         await deleteMessage(this.chatId, msgId);
-        this.toolMessages.delete(info.toolCallId);
       }
+      this.toolMessages.delete(info.toolCallId);
     } else if (info.status === "failed") {
-      // Replace with failure message (keep visible)
       const msgId = this.toolMessages.get(info.toolCallId);
-      if (msgId) {
+      if (msgId && msgId > 0) {
         await deleteMessage(this.chatId, msgId);
-        this.toolMessages.delete(info.toolCallId);
       }
-      // Show error
+      this.toolMessages.delete(info.toolCallId);
       const title = info.title || "Tool call";
       let errText = `❌ ${title} failed`;
       if (info.rawOutput) {
@@ -151,6 +171,20 @@ class ToolCallTracker {
       await sendTelegramMessage(this.chatId, errText, {
         message_thread_id: this.threadId || undefined,
       });
+    } else {
+      // Intermediate update — post the actual command if we deferred earlier
+      const msgId = this.toolMessages.get(info.toolCallId);
+      if (msgId === 0 && info.title && !this.isGenericTitle(info.title)) {
+        // Deferred "Terminal" — now we have the real command, send it
+        const short = info.title.length > 200 ? info.title.slice(0, 200) + "..." : info.title;
+        const text = `⚡\n\`\`\`bash\n${short}\n\`\`\``;
+        const res = await sendTelegramMessage(this.chatId, text, {
+          message_thread_id: this.threadId || undefined,
+        });
+        if (res.messageId) {
+          this.toolMessages.set(info.toolCallId, res.messageId);
+        }
+      }
     }
   }
 
@@ -372,10 +406,20 @@ export async function handleUpdate(update: any): Promise<void> {
     return;
   }
 
+  if (text === "/stop" || text === "/exit") {
+    const stopped = sessions.stopAgent(chatId, threadId);
+    await sendTelegramMessage(chatId, stopped ? "Agent stopped. Use /claude --resume to continue." : "No active session.", {
+      message_thread_id: threadId || undefined,
+      format: false,
+    });
+    return;
+  }
+
   if (text === "/clear") {
     const killed = sessions.killAgent(chatId, threadId);
-    await sendTelegramMessage(chatId, killed ? "Session cleared." : "No active session.", {
+    await sendTelegramMessage(chatId, killed ? "Session cleared. Next /claude starts fresh." : "No active session.", {
       message_thread_id: threadId || undefined,
+      format: false,
     });
     return;
   }
@@ -456,22 +500,58 @@ export async function handleUpdate(update: any): Promise<void> {
     return;
   }
 
-  // /claude [path] — set workdir and start claude agent
+  // /claude [--resume | path] — start/resume agent
   if (text.startsWith("/claude") || text.startsWith("/codex")) {
     const agentType = text.startsWith("/claude") ? "claude" : "codex";
-    const rawPath = text.replace(/^\/(claude|codex)\s*/, "").trim();
+    const rawArgs = text.replace(/^\/(claude|codex)\s*/, "").trim();
 
-    if (rawPath) {
-      // Set new workdir
+    // --resume: resume stopped session
+    if (rawArgs === "--resume" || rawArgs === "-r") {
+      const config = db.getThreadConfig(chatId, threadId);
+      if (!config) {
+        await sendTelegramMessage(chatId, "No thread config. Start with /claude <path> first.", { format: false, message_thread_id: threadId || undefined });
+        return;
+      }
+
+      const silentCallbacks: SessionCallbacks = {
+        onTextChunk: async () => {},
+        onToolCall: async () => {},
+        onToolCallUpdate: async () => {},
+        onPermissionRequest: async (params: any) => {
+          const options = params.options || [];
+          const opt = options.find((o: any) => o.kind === "allow_always") || options[0];
+          return { outcome: { outcome: "selected", optionId: opt?.optionId || "allow" } };
+        },
+      };
+
+      try {
+        const { resumed, sessionId } = await sessions.resumeAgent(
+          chatId, threadId, config.agent_type as AgentType, silentCallbacks, config.workdir
+        );
+        const label = config.name || config.workdir;
+        await sendTelegramMessage(chatId,
+          resumed
+            ? `[${label}] resumed session ${sessionId.slice(0, 8)}...`
+            : `[${label}] previous session not found, started fresh`,
+          { format: false, message_thread_id: threadId || undefined }
+        );
+      } catch (err) {
+        await sendTelegramMessage(chatId, `Resume failed: ${err}`, { format: false, message_thread_id: threadId || undefined });
+      }
+      return;
+    }
+
+    if (rawArgs) {
+      // Set new workdir + fresh session
       let folderPath: string;
-      if (rawPath === "system") {
+      if (rawArgs === "system") {
         folderPath = process.cwd(); // project root
-      } else if (rawPath.startsWith("~/")) {
-        folderPath = rawPath.replace("~", process.env.HOME || "~");
-      } else if (rawPath.startsWith("/")) {
-        folderPath = rawPath;
+      } else if (rawArgs.startsWith("~/")) {
+        folderPath = rawArgs.replace("~", process.env.HOME || "~");
+      } else if (rawArgs.startsWith("/")) {
+        folderPath = rawArgs;
       } else {
-        folderPath = `${process.cwd()}/threads/${rawPath}`;
+        folderPath = `${process.cwd()}/threads/${rawArgs}`;
       }
 
       await Bun.$`mkdir -p ${folderPath}`;
@@ -487,7 +567,7 @@ export async function handleUpdate(update: any): Promise<void> {
       // Link shared skills
       await linkSkills(folderPath);
 
-      // Kill existing agent if switching
+      // Kill existing agent + clear session (fresh start)
       sessions.killAgent(chatId, threadId);
 
       await db.saveThreadConfig({
@@ -495,17 +575,20 @@ export async function handleUpdate(update: any): Promise<void> {
         thread_id: threadId,
         workdir: folderPath,
         agent_type: agentType,
-        name: `${agentType}:${rawPath}`,
+        name: rawArgs,
       });
 
       await sendTelegramMessage(chatId, `${agentType} ready\nworkdir: ${folderPath}`, { format: false, message_thread_id: threadId || undefined });
     } else {
-      // No path — show current config or usage
+      // No args — show current config or usage
       const config = db.getThreadConfig(chatId, threadId);
       if (config) {
-        await sendTelegramMessage(chatId, `${config.agent_type} active\nworkdir: ${config.workdir}`, { format: false, message_thread_id: threadId || undefined });
+        const saved = db.getAcpSession(chatId, threadId);
+        const hasSession = saved?.session_id ? ` (session: ${saved.session_id.slice(0, 8)}...)` : "";
+        const status = saved?.active ? "active" : saved?.session_id ? "stopped" : "no session";
+        await sendTelegramMessage(chatId, `${config.agent_type} [${status}]${hasSession}\nworkdir: ${config.workdir}`, { format: false, message_thread_id: threadId || undefined });
       } else {
-        await sendTelegramMessage(chatId, `Usage: /claude <path>\nExamples:\n  /claude health\n  /claude ~/myrepo\n  /codex myproject`, { format: false, message_thread_id: threadId || undefined });
+        await sendTelegramMessage(chatId, `Usage: /claude <path>\nExamples:\n  /claude health\n  /claude ~/myrepo\n  /claude --resume\n  /codex myproject`, { format: false, message_thread_id: threadId || undefined });
       }
     }
     return;

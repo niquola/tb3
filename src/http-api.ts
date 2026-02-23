@@ -3,6 +3,7 @@
 
 import { Cron } from "croner";
 import { sendTelegramMessage, sendTelegramMessageChunked } from "./telegram/send";
+import { api } from "./telegram/api";
 import * as db from "./store";
 import * as sessions from "./acp/session-manager";
 import type { AgentType, SessionCallbacks, ToolCallInfo } from "./acp/types";
@@ -40,11 +41,23 @@ export async function handleApiRequest(req: Request): Promise<Response> {
   if (url.pathname === "/api/send" && req.method === "POST") {
     try {
       const body = await req.json();
-      const { text, workdir, chat_id, format } = body;
+      const { text, workdir, chat_id, format, parse_mode } = body;
       if (!text) return Response.json({ ok: false, error: "text required" }, { status: 400 });
 
       const thread = resolveThread(workdir, chat_id);
       if (!thread) return Response.json({ ok: false, error: "thread not found. Provide workdir or chat_id" }, { status: 404 });
+
+      // Raw parse_mode (HTML/MarkdownV2) — send directly via Telegram API
+      if (parse_mode) {
+        const payload: any = {
+          chat_id: thread.chat_id,
+          text,
+          parse_mode,
+        };
+        if (thread.thread_id) payload.message_thread_id = thread.thread_id;
+        const rawRes = await api("sendMessage", payload);
+        return Response.json({ ok: rawRes.ok, message_id: rawRes.result?.message_id });
+      }
 
       const res = await sendTelegramMessage(thread.chat_id, text, {
         format: format !== false,

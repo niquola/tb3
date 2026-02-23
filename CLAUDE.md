@@ -12,7 +12,7 @@ Telegram Handler (src/telegram/)
 Session Manager (src/acp/session-manager.ts)
     ↕ (stdio JSON-RPC via ACP SDK)
 ┌─────────────────────┬──────────────────────┐
-│  claude-agent-acp   │  codex app-server    │
+│  claude-agent-acp   │  codex-acp           │
 │  (child process)    │  (child process)     │
 └─────────────────────┴──────────────────────┘
 ```
@@ -29,6 +29,18 @@ bun src/index.ts
 ```
 
 Uses Bun runtime. Loads `.env` automatically (no dotenv).
+
+### launchd (macOS)
+
+Managed via `~/Library/LaunchAgents/com.niquola.tb3.plist`. Runs as login agent with `KeepAlive: true` (auto-restart on crash). Uses `zsh -lc` to load shell profile (PATH, env vars).
+
+```bash
+launchctl load ~/Library/LaunchAgents/com.niquola.tb3.plist    # start
+launchctl unload ~/Library/LaunchAgents/com.niquola.tb3.plist  # stop
+launchctl stop com.niquola.tb3                                 # restart (KeepAlive restarts it)
+```
+
+Logs: `logs/stdout.log`, `logs/stderr.log` (gitignored).
 
 ### Environment Variables
 
@@ -70,20 +82,34 @@ threads/                     # Per-thread working directories (gitignored)
 
 ## Bot Commands
 
-- `/claude <path>` — Start Claude agent with workdir (`/claude health`, `/claude ~/myrepo`, `/claude system`)
-- `/codex <path>` — Start Codex agent with workdir
+- `/claude <path>` — Start Claude agent with fresh session (`/claude health`, `/claude ~/myrepo`, `/claude system`)
+- `/claude --resume` — Resume a previously stopped session (restores conversation history)
+- `/claude` — Show current agent status (active/stopped/no session)
+- `/codex <path>` — Start Codex agent (same options as `/claude`)
+- `/stop` or `/exit` — Stop agent process but preserve session for later resume
+- `/clear` — Kill agent and clear session (next `/claude` starts completely fresh)
 - `/mode [id]` — Show/set agent mode (default, acceptEdits, plan, dontAsk, bypassPermissions)
 - `/model [id]` — Show/set model (default=Opus 4.6, sonnet=Sonnet 4.6, haiku=Haiku 4.5)
-- `/clear` — Kill current agent session
 - `/cancel` — Cancel running prompt
 
 Path resolution: bare name → `threads/<name>`, `~/...` → home-relative, `/...` → absolute, `system` → project root.
+
+### Session Lifecycle Commands
+
+```
+/claude health      → fresh session in threads/health/
+  ... work ...
+/stop               → agent killed, session_id preserved
+  ... later ...
+/claude --resume    → re-spawns agent, loadSession restores history
+/clear              → kills agent, deletes session_id (fresh start next time)
+```
 
 ## ACP Integration
 
 Agents are spawned as child processes speaking ACP over stdio:
 - **Claude**: `node_modules/.bin/claude-agent-acp` (wraps Claude Agent SDK)
-- **Codex**: `codex app-server --listen stdio://`
+- **Codex**: `node_modules/.bin/codex-acp` (ACP adapter for Codex CLI, auth via ChatGPT subscription)
 
 Communication via `ndJsonStream` + `ClientSideConnection` from `@agentclientprotocol/sdk`.
 
@@ -94,6 +120,7 @@ Communication via `ndJsonStream` + `ClientSideConnection` from `@agentclientprot
 3. Subsequent messages → reuses live agent, calls `connection.prompt()`
 4. On restart → `restoreAllSessions()` → spawns fresh process → `loadSession({ sessionId })` to restore history
 5. `/clear` → `killAgent()` → kills process, marks inactive in state
+6. On shutdown (SIGINT/SIGTERM) → `killAllAgents()` → kills all child processes to prevent orphans
 
 ### Streaming Display
 
@@ -122,6 +149,7 @@ All endpoints on `http://localhost:3034`:
 
 - `@agentclientprotocol/sdk` — ACP client SDK (ClientSideConnection, ndJsonStream)
 - `@zed-industries/claude-agent-acp` — Claude Code as ACP agent (child process)
+- `@zed-industries/codex-acp` — OpenAI Codex as ACP agent (child process)
 - `croner` — Cron expression scheduler
 - `telegram-markdown-v2` — MarkdownV2 formatting
 

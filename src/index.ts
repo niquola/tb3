@@ -2,7 +2,7 @@ import { loadState } from "./store";
 import { startPolling } from "./telegram/poller";
 import { handleUpdate } from "./telegram/handler";
 import { api } from "./telegram/api";
-import { getActiveAgentCount, restoreAllSessions } from "./acp/session-manager";
+import { getActiveAgentCount, restoreAllSessions, killAllAgents } from "./acp/session-manager";
 import { handleApiRequest, restoreCrons } from "./http-api";
 
 const botToken = process.env.TELEGRAM_BOT_TOKEN;
@@ -26,11 +26,12 @@ await Bun.$`mkdir -p ${process.cwd()}/files`;
 // Register bot commands
 await api("setMyCommands", {
   commands: [
-    { command: "claude", description: "Start Claude agent: /claude <path>" },
-    { command: "codex", description: "Start Codex agent: /codex <path>" },
+    { command: "claude", description: "Start Claude: /claude <path> or /claude --resume" },
+    { command: "codex", description: "Start Codex: /codex <path> or /codex --resume" },
+    { command: "stop", description: "Stop agent (can resume later)" },
+    { command: "clear", description: "Clear session (fresh start)" },
     { command: "mode", description: "Set agent mode (default/plan/acceptEdits/bypassPermissions)" },
     { command: "model", description: "Set model (default/sonnet/haiku)" },
-    { command: "clear", description: "Kill current agent session" },
     { command: "cancel", description: "Cancel running prompt" },
   ],
 });
@@ -62,6 +63,15 @@ restoreCrons().catch((err) => {
 restoreAllSessions().catch((err) => {
   console.error("[restore] Failed:", err);
 });
+
+// Graceful shutdown — kill all agent child processes
+function cleanup() {
+  console.log("[shutdown] Cleaning up agent processes...");
+  killAllAgents();
+  process.exit(0);
+}
+process.on("SIGINT", cleanup);
+process.on("SIGTERM", cleanup);
 
 // Start polling
 startPolling(handleUpdate);
