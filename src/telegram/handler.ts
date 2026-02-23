@@ -1,0 +1,454 @@
+import { api, deleteMessage, sendTyping } from "./api";
+import { sendTelegramMessage, sendTelegramMessageChunked } from "./send";
+import * as sessions from "../acp/session-manager";
+import * as db from "../store";
+import type { AgentType, SessionCallbacks, ToolCallInfo } from "../acp/types";
+
+const allowedUserId = process.env.TELEGRAM_ALLOWED_USER || "";
+const SKILLS_DIR = `${process.cwd()}/skills`;
+
+async function linkSkills(workdir: string): Promise<void> {
+  try {
+    const skillsTarget = `${workdir}/.claude/skills`;
+    await Bun.$`mkdir -p ${skillsTarget}`;
+
+    // Scan available skills and create symlinks
+    const glob = new Bun.Glob("*");
+    for await (const name of glob.scan({ cwd: SKILLS_DIR, onlyFiles: false })) {
+      const link = `${skillsTarget}/${name}`;
+      const target = `${SKILLS_DIR}/${name}`;
+      try {
+        await Bun.$`ln -sfn ${target} ${link}`;
+      } catch {}
+    }
+  } catch (err) {
+    console.error(`[skills] Failed to link skills to ${workdir}:`, err);
+  }
+}
+
+// --- Permission Request Queue ---
+let permCounter = 0;
+// Map permId -> { resolve, options, timeout }
+const pendingPermissions = new Map<
+  number,
+  { resolve: (optionId: string) => void; options: any[]; timeout: ReturnType<typeof setTimeout>; params: any; workdir: string }
+>();
+
+const PERMISSION_TIMEOUT_MS = 5 * 60 * 1000;
+
+const TOOL_ICONS: Record<string, string> = {
+  read: "📖",
+  edit: "✏️",
+  delete: "🗑️",
+  move: "📦",
+  search: "🔍",
+  execute: "⚡",
+  think: "🤔",
+  fetch: "🌐",
+  other: "🔧",
+};
+
+// --- Text Accumulator ---
+class TextAccumulator {
+  private buffer = "";
+  private flushTimer: ReturnType<typeof setTimeout> | null = null;
+
+  constructor(
+    private chatId: number,
+    private threadId: number,
+    private debounceMs = 800
+  ) {}
+
+  async append(text: string): Promise<void> {
+    this.buffer += text;
+    if (this.flushTimer) clearTimeout(this.flushTimer);
+
+    if (this.buffer.length > 3500) {
+      await this.flush();
+    } else {
+      this.flushTimer = setTimeout(() => this.flush(), this.debounceMs);
+    }
+  }
+
+  async flush(): Promise<void> {
+    if (!this.buffer) return;
+    const text = this.buffer;
+    this.buffer = "";
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
+    await sendTelegramMessageChunked(this.chatId, text, {
+      message_thread_id: this.threadId || undefined,
+    });
+  }
+}
+
+// --- Tool Call Tracker ---
+class ToolCallTracker {
+  private toolMessages = new Map<string, number>(); // toolCallId -> messageId
+
+  constructor(
+    private chatId: number,
+    private threadId: number
+  ) {}
+
+  private formatToolText(info: ToolCallInfo): string {
+    const icon = TOOL_ICONS[info.kind || "other"] || "🔧";
+
+    // For execute/bash tools, show the command as a code block
+    if (info.kind === "execute" && info.rawInput) {
+      const cmd = typeof info.rawInput === "string"
+        ? info.rawInput
+        : (info.rawInput as any).command || (info.rawInput as any).cmd || "";
+      if (cmd) {
+        const short = cmd.length > 200 ? cmd.slice(0, 200) + "..." : cmd;
+        return `${icon} ${info.title}\n\`\`\`\n${short}\n\`\`\``;
+      }
+    }
+
+    return `${icon} ${info.title}`;
+  }
+
+  async onToolCall(info: ToolCallInfo): Promise<void> {
+    // Don't show messages for already-completed tools (from session replay)
+    if (info.status === "completed") return;
+
+    const text = this.formatToolText(info);
+    const res = await sendTelegramMessage(this.chatId, text, {
+      message_thread_id: this.threadId || undefined,
+    });
+    if (res.messageId) {
+      this.toolMessages.set(info.toolCallId, res.messageId);
+    }
+  }
+
+  async onUpdate(info: ToolCallInfo): Promise<void> {
+    if (info.status === "completed") {
+      // Delete the in-progress message
+      const msgId = this.toolMessages.get(info.toolCallId);
+      if (msgId) {
+        await deleteMessage(this.chatId, msgId);
+        this.toolMessages.delete(info.toolCallId);
+      }
+    } else if (info.status === "failed") {
+      // Replace with failure message (keep visible)
+      const msgId = this.toolMessages.get(info.toolCallId);
+      if (msgId) {
+        await deleteMessage(this.chatId, msgId);
+        this.toolMessages.delete(info.toolCallId);
+      }
+      // Show error
+      const title = info.title || "Tool call";
+      let errText = `❌ ${title} failed`;
+      if (info.rawOutput) {
+        const out = typeof info.rawOutput === "string"
+          ? info.rawOutput
+          : JSON.stringify(info.rawOutput);
+        const short = out.length > 500 ? out.slice(0, 500) + "..." : out;
+        errText += `\n\`\`\`\n${short}\n\`\`\``;
+      }
+      await sendTelegramMessage(this.chatId, errText, {
+        message_thread_id: this.threadId || undefined,
+      });
+    }
+  }
+
+  async cleanup(): Promise<void> {
+    for (const [, msgId] of this.toolMessages) {
+      await deleteMessage(this.chatId, msgId);
+    }
+    this.toolMessages.clear();
+  }
+}
+
+// --- Tool Permission Persistence ---
+
+async function saveToolPermission(workdir: string, params: any, optionKind: string): Promise<void> {
+  if (optionKind !== "allow_always") return;
+
+  const toolName = params.toolCall?.tool || params.toolCall?.title || "";
+  if (!toolName) return;
+
+  const settingsPath = `${workdir}/.claude/settings.json`;
+  let settings: any = {};
+  try {
+    const file = Bun.file(settingsPath);
+    if (await file.exists()) {
+      settings = await file.json();
+    }
+  } catch {}
+
+  if (!settings.permissions) settings.permissions = { allow: [], deny: [] };
+  if (!settings.permissions.allow) settings.permissions.allow = [];
+
+  const pattern = `${toolName}(*)`;
+  if (!settings.permissions.allow.includes(pattern)) {
+    settings.permissions.allow.push(pattern);
+    await Bun.$`mkdir -p ${workdir}/.claude`;
+    await Bun.write(settingsPath, JSON.stringify(settings, null, 2));
+    console.log(`[perm] saved ${pattern} to ${settingsPath}`);
+  }
+}
+
+// --- Permission via Telegram ---
+
+async function requestPermissionViaTelegram(
+  chatId: number,
+  threadId: number,
+  params: any,
+  workdir: string
+): Promise<any> {
+  const title = params.toolCall?.title || "Tool operation";
+  const options = params.options || [];
+  const id = ++permCounter;
+
+  // Short callback_data: "p:ID:INDEX" (e.g. "p:1:0", "p:1:1", "p:1:2")
+  const keyboard = options.map((opt: any, i: number) => [{
+    text: `${opt.kind === "allow_once" ? "✅" : opt.kind === "reject_once" ? "❌" : "🔄"} ${opt.name || opt.kind}`,
+    callback_data: `p:${id}:${i}`,
+  }]);
+
+  console.log(`[perm] #${id} requesting: ${title} (${options.map((o: any) => o.optionId).join(", ")})`);
+
+  await sendTelegramMessage(chatId, `🔐 Permission: ${title}`, {
+    message_thread_id: threadId || undefined,
+    format: false,
+    reply_markup: { inline_keyboard: keyboard },
+  });
+
+  return new Promise((resolve) => {
+    const timeout = setTimeout(() => {
+      console.log(`[perm] #${id} timed out, auto-rejecting`);
+      const rejectOption = options.find((o: any) => o.kind === "reject_once");
+      const fallback = rejectOption?.optionId || options[0]?.optionId || "reject";
+      resolve({ outcome: { outcome: "selected", optionId: fallback } });
+      pendingPermissions.delete(id);
+    }, PERMISSION_TIMEOUT_MS);
+
+    pendingPermissions.set(id, {
+      resolve: (optionId: string) => {
+        clearTimeout(timeout);
+        resolve({ outcome: { outcome: "selected", optionId } });
+      },
+      options,
+      timeout,
+      params,
+      workdir,
+    });
+  });
+}
+
+// --- Callback Query Handler ---
+
+function handleCallbackQuery(query: any): void {
+  const data = query.data as string;
+  if (!data.startsWith("p:")) return;
+
+  const parts = data.split(":");
+  const permId = parseInt(parts[1]);
+  const optionIndex = parseInt(parts[2]);
+
+  console.log(`[perm] callback: permId=${permId} optionIndex=${optionIndex}`);
+
+  const pending = pendingPermissions.get(permId);
+  if (pending) {
+    const option = pending.options[optionIndex];
+    const optionId = option?.optionId;
+    const optionName = option?.name || optionId;
+    const optionKind = option?.kind;
+    console.log(`[perm] #${permId} resolved: ${optionId} (${optionKind})`);
+    pending.resolve(optionId);
+    pendingPermissions.delete(permId);
+
+    // Persist "allow always" to .claude/settings.json in workdir
+    if (optionKind === "allow_always" && pending.workdir) {
+      saveToolPermission(pending.workdir, pending.params, optionKind).catch(console.error);
+    }
+
+    api("answerCallbackQuery", { callback_query_id: query.id, text: optionName });
+    // Delete the permission message
+    if (query.message) {
+      deleteMessage(query.message.chat.id, query.message.message_id);
+    }
+  } else {
+    console.log(`[perm] #${permId} not found in pending map`);
+    api("answerCallbackQuery", { callback_query_id: query.id, text: "Expired" });
+    if (query.message) {
+      deleteMessage(query.message.chat.id, query.message.message_id);
+    }
+  }
+}
+
+// --- Main Update Handler ---
+
+export async function handleUpdate(update: any): Promise<void> {
+  // Handle callback queries (permission responses)
+  if (update.callback_query) {
+    handleCallbackQuery(update.callback_query);
+    return;
+  }
+
+  const msg = update.message;
+  if (!msg) return;
+
+  const chatId = msg.chat.id;
+  const threadId = msg.message_thread_id || 0;
+  const text = msg.text || msg.caption || "";
+  const fromId = msg.from?.id;
+  const fromName = msg.from?.first_name || msg.from?.username || "Unknown";
+
+  console.log(`[msg] chat=${chatId} thread=${threadId} type=${msg.chat.type} from=${fromId} text="${text.slice(0, 50)}" topic=${msg.reply_to_message?.forum_topic_created?.name || "-"}`);
+
+  // Only work in private chats (DM)
+  if (msg.chat.type !== "private") return;
+
+  // Authorization
+  if (allowedUserId && String(fromId) !== allowedUserId) {
+    await sendTelegramMessage(chatId, "Вы кто такие? Я вас не знаю!", {
+      message_thread_id: threadId || undefined,
+      replyToMessageId: msg.message_id,
+    });
+    return;
+  }
+
+  // Log user message
+  await db.saveMessage({
+    chat_id: chatId,
+    thread_id: threadId,
+    message_id: msg.message_id,
+    from_id: fromId,
+    from_name: fromName,
+    role: "user",
+    content: text,
+  }).catch(console.error);
+
+  // Commands
+  if (text === "/start") {
+    await sendTelegramMessage(chatId, "tb3 ready. Send a message to start coding.", {
+      message_thread_id: threadId || undefined,
+    });
+    return;
+  }
+
+  if (text === "/clear") {
+    const killed = sessions.killAgent(chatId, threadId);
+    await sendTelegramMessage(chatId, killed ? "Session cleared." : "No active session.", {
+      message_thread_id: threadId || undefined,
+    });
+    return;
+  }
+
+  if (text === "/cancel") {
+    const cancelled = await sessions.cancelPrompt(chatId, threadId);
+    await sendTelegramMessage(chatId, cancelled ? "Cancelling..." : "Nothing to cancel.", {
+      message_thread_id: threadId || undefined,
+    });
+    return;
+  }
+
+  // /claude [path] — set workdir and start claude agent
+  if (text.startsWith("/claude") || text.startsWith("/codex")) {
+    const agentType = text.startsWith("/claude") ? "claude" : "codex";
+    const rawPath = text.replace(/^\/(claude|codex)\s*/, "").trim();
+
+    if (rawPath) {
+      // Set new workdir
+      let folderPath: string;
+      if (rawPath.startsWith("~/")) {
+        folderPath = rawPath.replace("~", process.env.HOME || "~");
+      } else if (rawPath.startsWith("/")) {
+        folderPath = rawPath;
+      } else {
+        folderPath = `${process.cwd()}/threads/${rawPath}`;
+      }
+
+      await Bun.$`mkdir -p ${folderPath}`;
+
+      // Create CLAUDE.md if not exists
+      const claudeMd = `${folderPath}/CLAUDE.md`;
+      try {
+        if (!(await Bun.file(claudeMd).exists())) {
+          await Bun.write(claudeMd, "");
+        }
+      } catch {}
+
+      // Link shared skills
+      await linkSkills(folderPath);
+
+      // Kill existing agent if switching
+      sessions.killAgent(chatId, threadId);
+
+      await db.saveThreadConfig({
+        chat_id: chatId,
+        thread_id: threadId,
+        workdir: folderPath,
+        agent_type: agentType,
+        name: `${agentType}:${rawPath}`,
+      });
+
+      await sendTelegramMessage(chatId, `${agentType} ready\nworkdir: ${folderPath}`, { format: false });
+    } else {
+      // No path — show current config or usage
+      const config = db.getThreadConfig(chatId, threadId);
+      if (config) {
+        await sendTelegramMessage(chatId, `${config.agent_type} active\nworkdir: ${config.workdir}`, { format: false });
+      } else {
+        await sendTelegramMessage(chatId, `Usage: /claude <path>\nExamples:\n  /claude health\n  /claude ~/myrepo\n  /codex myproject`, { format: false });
+      }
+    }
+    return;
+  }
+
+  if (!text || text.startsWith("/")) return;
+
+  // --- Regular message → send to ACP agent ---
+  const config = db.getThreadConfig(chatId, threadId);
+  if (!config) {
+    await sendTelegramMessage(chatId, `No agent. Start with:\n  /claude health\n  /claude ~/myrepo`, { format: false });
+    return;
+  }
+
+  // Send typing indicator
+  sendTyping(chatId);
+
+  const accumulator = new TextAccumulator(chatId, threadId);
+  const toolTracker = new ToolCallTracker(chatId, threadId);
+
+  const callbacks: SessionCallbacks = {
+    onTextChunk: async (text: string) => {
+      await accumulator.append(text);
+    },
+    onToolCall: async (info: ToolCallInfo) => {
+      await toolTracker.onToolCall(info);
+    },
+    onToolCallUpdate: async (info: ToolCallInfo) => {
+      await toolTracker.onUpdate(info);
+    },
+    onPermissionRequest: async (params: any) => {
+      return requestPermissionViaTelegram(chatId, threadId, params, config.workdir);
+    },
+  };
+
+  try {
+    const result = await sessions.sendPrompt(
+      chatId,
+      threadId,
+      text,
+      config.agent_type as AgentType,
+      callbacks,
+      config.workdir
+    );
+
+    // Flush any remaining text
+    await accumulator.flush();
+    await toolTracker.cleanup();
+
+    console.log(`[agent] done: ${result.stopReason}`);
+  } catch (err) {
+    await accumulator.flush();
+    await toolTracker.cleanup();
+    console.error(`[agent] error:`, err);
+    await sendTelegramMessage(chatId, `Error: ${String(err)}`, { format: false });
+  }
+}
