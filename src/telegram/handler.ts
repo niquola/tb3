@@ -1,4 +1,4 @@
-import { api, deleteMessage, sendTyping } from "./api";
+import { api, deleteMessage, sendTyping, getFileInfo, downloadTelegramFile } from "./api";
 import { sendTelegramMessage, sendTelegramMessageChunked } from "./send";
 import * as sessions from "../acp/session-manager";
 import * as db from "../store";
@@ -594,7 +594,28 @@ export async function handleUpdate(update: any): Promise<void> {
     return;
   }
 
-  if (!text || text.startsWith("/")) return;
+  // --- Handle media attachments ---
+  let promptText = text;
+  const fileInfo = getFileInfo(msg);
+  if (fileInfo) {
+    const config = db.getThreadConfig(chatId, threadId);
+    if (config) {
+      const downloaded = await downloadTelegramFile(fileInfo.fileId);
+      if (downloaded) {
+        const filesDir = `${config.workdir}/files`;
+        await Bun.$`mkdir -p ${filesDir}`;
+        const savedPath = `${filesDir}/${fileInfo.fileName}`;
+        await Bun.write(savedPath, downloaded.data);
+        console.log(`[file] saved ${fileInfo.type}: ${savedPath}`);
+        const caption = msg.caption || "";
+        promptText = caption
+          ? `${caption}\n\n[Attached file: ${savedPath}]`
+          : `[Attached file: ${savedPath}]`;
+      }
+    }
+  }
+
+  if (!promptText || promptText.startsWith("/")) return;
 
   // --- Regular message → send to ACP agent ---
   const config = db.getThreadConfig(chatId, threadId);
@@ -628,7 +649,7 @@ export async function handleUpdate(update: any): Promise<void> {
     const result = await sessions.sendPrompt(
       chatId,
       threadId,
-      text,
+      promptText,
       config.agent_type as AgentType,
       callbacks,
       config.workdir
