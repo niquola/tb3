@@ -289,24 +289,31 @@ async function saveCronDefs(): Promise<void> {
   await Bun.write(CRONS_PATH, JSON.stringify(defs, null, 2));
 }
 
+const CRON_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
+
 function startCron(id: string, def: CronDef): void {
   // Stop existing if any
   liveCrons.get(id)?.cron.stop();
 
   const job = new Cron(def.cron, async () => {
     try {
-      console.log(`[cron] ${id}: triggering agent for chat ${def.chatId}`);
+      console.log(`[cron] ${id}: triggering for chat ${def.chatId} thread ${def.threadId}`);
+
+      // Notify thread that cron fired
+      await sendTelegramMessage(def.chatId, `⏰ ${def.name}: ${def.text}`, {
+        format: false,
+        message_thread_id: def.threadId || undefined,
+      });
+
       const config = db.getThreadConfig(def.chatId, def.threadId || 0);
       if (!config) {
-        console.error(`[cron] ${id}: no thread config for chat ${def.chatId}`);
-        await sendTelegramMessage(def.chatId, def.text, { format: false, message_thread_id: def.threadId });
+        console.error(`[cron] ${id}: no thread config for chat ${def.chatId}:${def.threadId}`);
         return;
       }
 
       // Stream agent response to Telegram
       let buffer = "";
       let flushTimer: ReturnType<typeof setTimeout> | null = null;
-      const toolMessages = new Map<string, number>();
 
       const flush = async () => {
         if (!buffer) return;
@@ -334,14 +341,15 @@ function startCron(id: string, def: CronDef): void {
         onToolCallUpdate: async (_info: ToolCallInfo) => {},
         onPermissionRequest: async (params: any) => {
           // Auto-allow for cron jobs
-          const allowOption = params.options?.find((o: any) => o.kind === "allow_once");
+          const allowOption = params.options?.find((o: any) => o.kind === "allow_always") || params.options?.find((o: any) => o.kind === "allow_once");
           const fallback = params.options?.[0];
           const option = allowOption || fallback;
           return { outcome: { outcome: "selected", optionId: option?.optionId || "allow" } };
         },
       };
 
-      const result = await sessions.sendPrompt(
+      // Prompt with timeout
+      const promptPromise = sessions.sendPrompt(
         def.chatId,
         def.threadId || 0,
         def.text,
@@ -350,10 +358,21 @@ function startCron(id: string, def: CronDef): void {
         config.workdir
       );
 
+      const timeoutPromise = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error(`Cron prompt timed out after ${CRON_TIMEOUT_MS / 1000}s`)), CRON_TIMEOUT_MS)
+      );
+
+      const result = await Promise.race([promptPromise, timeoutPromise]);
+
       await flush();
-      console.log(`[cron] ${id}: agent done: ${result.stopReason}`);
+      console.log(`[cron] ${id}: done: ${result.stopReason}`);
     } catch (err) {
       console.error(`[cron] ${id} error:`, err);
+      // Notify thread about failure
+      await sendTelegramMessage(def.chatId, `⏰ ${def.name} failed: ${String(err).slice(0, 200)}`, {
+        format: false,
+        message_thread_id: def.threadId || undefined,
+      }).catch(() => {});
     }
   });
 
